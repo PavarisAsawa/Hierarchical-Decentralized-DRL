@@ -98,8 +98,11 @@ class AntLegEnvCfg(DirectMARLEnvCfg):
         "right_back_foot" ,
     ]
 
-    heading_weight: float = 0.5
-    up_weight: float = 0.1
+    # Reward Function
+    tracking_lin_vel_weight: float = 1
+    yaw_weight: float = 1
+
+
 
     energy_cost_scale: float = 0.05
     actions_cost_scale: float = 0.005
@@ -183,39 +186,9 @@ class AntLegEnv(DirectMARLEnv):
         self.velocity, self.ang_velocity = self.robot.data.root_lin_vel_w, self.robot.data.root_ang_vel_w
         self.dof_pos, self.dof_vel = self.robot.data.joint_pos, self.robot.data.joint_vel
 
-        (
-            self.up_proj,
-            self.heading_proj,
-            self.up_vec,
-            self.heading_vec,
-            self.vel_loc,
-            self.angvel_loc,
-            self.roll,
-            self.pitch,
-            self.yaw,
-            self.angle_to_target,
-            self.dof_pos_scaled,
-            self.prev_potentials,
-            self.potentials,
-        ) = compute_intermediate_values(
-            self.targets,
-            self.torso_position,
-            self.torso_rotation,
-            self.velocity,
-            self.ang_velocity,
-            self.dof_pos,
-            self.robot.data.soft_joint_pos_limits[0, :, 0],
-            self.robot.data.soft_joint_pos_limits[0, :, 1],
-            self.inv_start_rot,
-            self.basis_vec0,
-            self.basis_vec1,
-            self.potentials,
-            self.prev_potentials,
-            self.cfg.sim.dt,
-        )
-
     def _pre_physics_step(self, actions: dict[str, torch.Tensor]) -> None:
         self.actions = actions
+        # print(actions)
 
 
     def _apply_action(self):
@@ -305,61 +278,102 @@ class AntLegEnv(DirectMARLEnv):
             ),
         }
         return observations
-    
 
-    def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def _get_dones(self) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:        
         self._compute_intermediate_values()
-        time_out = self.episode_length_buf >= self.max_episode_length - 1
-        died = self.torso_position[:, 2] < self.cfg.termination_height
-        return died, time_out
+        truncate = self.episode_length_buf >= self.max_episode_length - 1
+        terminate = self.torso_position[:, 2] < self.cfg.termination_height
 
-@torch.jit.script
-def compute_intermediate_values(
-    targets: torch.Tensor,
-    torso_position: torch.Tensor,
-    torso_rotation: torch.Tensor,
-    velocity: torch.Tensor,
-    ang_velocity: torch.Tensor,
-    dof_pos: torch.Tensor,
-    dof_lower_limits: torch.Tensor,
-    dof_upper_limits: torch.Tensor,
-    inv_start_rot: torch.Tensor,
-    basis_vec0: torch.Tensor,
-    basis_vec1: torch.Tensor,
-    potentials: torch.Tensor,
-    prev_potentials: torch.Tensor,
-    dt: float,
-):
-    to_target = targets - torso_position
-    to_target[:, 2] = 0.0
+        terminates = {agent : terminate for agent in self.cfg.possible_agents}
+        truncates = {agent : truncate for agent in self.cfg.possible_agents}
 
-    torso_quat, up_proj, heading_proj, up_vec, heading_vec = compute_heading_and_up(
-        torso_rotation, inv_start_rot, to_target, basis_vec0, basis_vec1, 2
-    )
+        return terminates, truncates
+    
+    def _reset_idx(self, env_ids: torch.Tensor | None):
+        if env_ids is None or len(env_ids) == self.num_envs:
+            env_ids = self.robot._ALL_INDICES
+        self.robot.reset(env_ids)
+        super()._reset_idx(env_ids)
 
-    vel_loc, angvel_loc, roll, pitch, yaw, angle_to_target = compute_rot(
-        torso_quat, velocity, ang_velocity, targets, torso_position
-    )
+        joint_pos = self.robot.data.default_joint_pos[env_ids]
+        joint_vel = self.robot.data.default_joint_vel[env_ids]
+        default_root_state = self.robot.data.default_root_state[env_ids]
+        default_root_state[:, :3] += self.scene.env_origins[env_ids]
 
-    dof_pos_scaled = torch_utils.maths.unscale(dof_pos, dof_lower_limits, dof_upper_limits)
+        self.robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
+        self.robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
+        self.robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
 
-    to_target = targets - torso_position
-    to_target[:, 2] = 0.0
-    prev_potentials[:] = potentials
-    potentials = -torch.norm(to_target, p=2, dim=-1) / dt
+        # clear out any old actions for those envs:
+        for leg_name, act_tensor in self.actions.items():
+            # zero only the rows corresponding to env_ids
+            self.actions[leg_name] = torch.zeros(self.num_envs , self.num_dofs)
 
-    return (
-        up_proj,
-        heading_proj,
-        up_vec,
-        heading_vec,
-        vel_loc,
-        angvel_loc,
-        roll,
-        pitch,
-        yaw,
-        angle_to_target,
-        dof_pos_scaled,
-        prev_potentials,
-        potentials,
-    )
+        self._commands[env_ids] = torch.zeros_like(self._commands[env_ids]).uniform_(-1.0, 1.0) # Curriculum add here
+
+    def _get_rewards(self) -> dict[str, torch.Tensor]:
+        rew_global = torch.tensor(0)
+
+        lin_vel_error = torch.sum(torch.square(self._commands[:, :2] - self.robot.data.root_lin_vel_b[:, :2]), dim=1)
+        lin_vel_error_mapped = torch.exp(-lin_vel_error / 0.25)
+
+        yaw_error = torch.square(self._commands[:, 2] - self.robot.data.heading_w)
+        yaw_error_mapped = torch.exp(-yaw_error / 0.25)
+
+        rew_global = lin_vel_error_mapped * self.cfg.tracking_lin_vel_weight + yaw_error_mapped * self.cfg.yaw_weight
+        return {
+            "fl_leg" : rew_global , 
+            "fr_leg" : rew_global , 
+            "hl_leg" : rew_global , 
+            "hr_leg" : rew_global , 
+            }
+# @torch.jit.script
+# def compute_intermediate_values(
+#     targets: torch.Tensor,
+#     torso_position: torch.Tensor,
+#     torso_rotation: torch.Tensor,
+#     velocity: torch.Tensor,
+#     ang_velocity: torch.Tensor,
+#     dof_pos: torch.Tensor,
+#     dof_lower_limits: torch.Tensor,
+#     dof_upper_limits: torch.Tensor,
+#     inv_start_rot: torch.Tensor,
+#     basis_vec0: torch.Tensor,
+#     basis_vec1: torch.Tensor,
+#     potentials: torch.Tensor,
+#     prev_potentials: torch.Tensor,
+#     dt: float,
+# ):
+#     to_target = targets - torso_position
+#     to_target[:, 2] = 0.0
+
+#     torso_quat, up_proj, heading_proj, up_vec, heading_vec = compute_heading_and_up(
+#         torso_rotation, inv_start_rot, to_target, basis_vec0, basis_vec1, 2
+#     )
+
+#     vel_loc, angvel_loc, roll, pitch, yaw, angle_to_target = compute_rot(
+#         torso_quat, velocity, ang_velocity, targets, torso_position
+#     )
+
+#     dof_pos_scaled = torch_utils.maths.unscale(dof_pos, dof_lower_limits, dof_upper_limits)
+
+#     to_target = targets - torso_position
+#     to_target[:, 2] = 0.0
+#     prev_potentials[:] = potentials
+#     potentials = -torch.norm(to_target, p=2, dim=-1) / dt
+
+#     return (
+#         up_proj,
+#         heading_proj,
+#         up_vec,
+#         heading_vec,
+#         vel_loc,
+#         angvel_loc,
+#         roll,
+#         pitch,
+#         yaw,
+#         angle_to_target,
+#         dof_pos_scaled,
+#         prev_potentials,
+#         potentials,
+#     )
