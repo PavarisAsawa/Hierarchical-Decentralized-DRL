@@ -66,23 +66,31 @@ def main():
             # sample actions from -1 to 1
             # actions = 2 * torch.rand(env.action_space.shape, device=env.unwrapped.device) - 1
             # apply actions
-            actions = random_action()
+            actions = random_action2()
+            print("actions: ", actions)
             env.step(actions)
 
     # close the simulator
     env.close()
+
+def random_action2():
+    dim = args_cli.num_envs
+    if args_cli.num_envs is None:
+        dim = 4096
+    return torch.empty(dim, 8).uniform_(-20, 20)  #20*torch.rand(dim, 8)
 
 def random_action() -> dict[str, torch.Tensor]:
     # shape tuple must be positional, not as size=
     dim = args_cli.num_envs
     if args_cli.num_envs is None:
         dim = 4096
+    # action = torch.zeros(dim, 2)
     action = torch.zeros(dim, 2)
     return {
-        "fl_leg": action,
-        "fr_leg": action,
-        "hl_leg": action,
-        "hr_leg": action,
+        "fl_leg": 2*torch.rand(dim, 2),
+        "fr_leg": 2*torch.rand(dim, 2),
+        "hl_leg": 2*torch.rand(dim, 2),
+        "hr_leg": 2*torch.rand(dim, 2),
     }
 
 if __name__ == "__main__":

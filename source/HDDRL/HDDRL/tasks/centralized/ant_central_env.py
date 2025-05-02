@@ -7,7 +7,7 @@ from collections.abc import Sequence
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, RigidObject
-from isaaclab.envs import DirectMARLEnv , DirectMARLEnvCfg
+from isaaclab.envs import DirectMARLEnv , DirectMARLEnvCfg , DirectRLEnvCfg , DirectRLEnv
 from isaaclab.markers import VisualizationMarkers
 
 from isaaclab.sim import PhysxCfg, SimulationCfg
@@ -29,26 +29,16 @@ from isaacsim.core.utils.torch.rotations import compute_heading_and_up, compute_
 import isaacsim.core.utils.torch as torch_utils
 
 @configclass
-class AntLegEnvCfg(DirectMARLEnvCfg):
+class AntCentralEnvCfg(DirectRLEnvCfg):
     # env
     episode_length_s = 15.0
     decimation = 2
     state_space = 0
     action_scale = 1
-    possible_agents = ["fl_leg" , "fr_leg" , "hl_leg" , "hr_leg"]
-    action_spaces = {"fl_leg" : 2 ,
-                     "fr_leg" : 2 ,
-                     "hl_leg" : 2 ,
-                     "hr_leg" : 2 , 
-                    }
     # action spaces each leg : dof_effort
 
-
-    observation_spaces = {"fl_leg" : 10 ,
-                     "fr_leg" : 10 ,
-                     "hl_leg" : 10 ,
-                     "hr_leg" : 10 , 
-                    }
+    action_space = 8
+    observation_space = 10
 
 
     # observation each leg -> dof_pos , dos_vel , dof_torque , contact_force 
@@ -81,28 +71,10 @@ class AntLegEnvCfg(DirectMARLEnvCfg):
 
     joint_gears: list = [15, 15, 15, 15, 15, 15, 15, 15]
     # joint_gears: list = [1, 1, 1, 1, 1, 1, 1, 1]
-    dof_per_leg = 2
-    fl_joint_names = [ # inx 0 1
-        "front_left_leg" ,
-        "front_left_foot" ,
-    ]
-    fr_joint_names = [ # inx 2 3
-        "front_right_leg" ,
-        "front_right_foot" ,
-    ]
-    hl_joint_names = [ # inx 4 5
-        "left_back_leg" ,
-        "left_back_foot" ,
-    ]
-    hr_joint_names = [ # inx 6 7
-        "right_back_leg" ,
-        "right_back_foot" ,
-    ]
 
     # Reward Function
     tracking_lin_vel_weight: float = 1
     yaw_weight: float = 1
-
 
 
     energy_cost_scale: float = 0.05
@@ -116,32 +88,18 @@ class AntLegEnvCfg(DirectMARLEnvCfg):
     # angular_velocity_scale: float = 1.0
     # contact_force_scale: float = 0.1
 
-class AntLegEnv(DirectMARLEnv):
-    cfg : AntLegEnvCfg
+class AntCentralEnv(DirectRLEnv):
+    cfg : AntCentralEnvCfg
 
-    def __init__(self, cfg: AntLegEnvCfg, render_mode: str | None = None, **kwargs):
+    def __init__(self, cfg: AntCentralEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
         # robot properties
         self.action_scale = self.cfg.action_scale
-        self.num_dofs = self.cfg.dof_per_leg
         self.joint_gears = torch.tensor(self.cfg.joint_gears, dtype=torch.float32, device=self.sim.device)
         self.motor_effort_ratio = torch.ones_like(self.joint_gears, device=self.sim.device)
-
-        self.fl_indices = list()
-        self.fr_indices = list()
-        self.hl_indices = list()
-        self.hr_indices = list()
-
-        # legged joint index
-        for dof in range(self.num_dofs):
-            self.fl_indices.append(self.robot.joint_names.index(self.cfg.fl_joint_names[dof]))
-            self.fr_indices.append(self.robot.joint_names.index(self.cfg.fr_joint_names[dof]))
-            self.hl_indices.append(self.robot.joint_names.index(self.cfg.hl_joint_names[dof]))
-            self.hr_indices.append(self.robot.joint_names.index(self.cfg.hr_joint_names[dof]))
-
         # All joint index
         self._joint_dof_idx, _ = self.robot.find_joints(".*")
-        
+
         # X/Y linear velocity and yaw angular velocity commands
         self._commands = torch.zeros(self.num_envs, 3, device=self.sim.device)
     
@@ -171,27 +129,17 @@ class AntLegEnv(DirectMARLEnv):
         self.velocity, self.ang_velocity = self.robot.data.root_lin_vel_w, self.robot.data.root_ang_vel_w
         self.dof_pos, self.dof_vel = self.robot.data.joint_pos, self.robot.data.joint_vel
 
-    def _pre_physics_step(self, actions: dict[str, torch.Tensor]) -> None:
-        self.actions = actions
+    def _pre_physics_step(self, actions: torch.Tensor) -> None:
+        self.actions = actions.clone()
         # print(actions)
 
 
     def _apply_action(self)-> None:
-        fl = self.actions["fl_leg"]
-        fr = self.actions["fr_leg"]
-        hl = self.actions["hl_leg"]
-        hr = self.actions["hr_leg"]
-        actions = torch.zeros((self.num_envs,len(self.joint_gears)), device=self.sim.device, dtype=torch.float32)
-        actions[:, self.fl_indices] = fl
-        actions[:, self.fr_indices] = fr
-        actions[:, self.hl_indices] = hl
-        actions[:, self.hr_indices] = hr
-        forces = self.action_scale * self.joint_gears * actions
+        forces = self.action_scale * self.joint_gears * self.actions
         self.robot.set_joint_effort_target(forces, joint_ids=self._joint_dof_idx)
-
         # print(self.robot._data.computed_torque)
 
-    def _get_observations(self) -> dict[str, torch.Tensor]:
+    def _get_observations(self) -> dict:
         '''
         -- Global -- 
         Linear Vel : Robot XY in base (2)
@@ -205,93 +153,53 @@ class AntLegEnv(DirectMARLEnv):
         > 4
         >> 10
         '''
-        observations = {
-            "fl_leg" : torch.cat(
+        observations =  torch.cat(
                 (
                     ## -- Global -- ##
                     self.robot.data.root_lin_vel_b[:,:2] ,
                     self.robot.data.root_ang_vel_b[:, 2:3] ,
                     self._commands,
                     ## -- Local -- ##
-                    self.robot.data.joint_pos[: , self.fl_indices] ,
-                    self.robot.data.joint_vel[: , self.fl_indices] ,
+                    self.robot.data.joint_pos[: , :] ,
+                    self.robot.data.joint_vel[: , :] ,
                 ),
-                dim=-1                
-            ),
-            "fr_leg" : torch.cat(
-                (
-                    ## -- Global -- ##
-                    self.robot.data.root_lin_vel_b[:,:2] ,
-                    self.robot.data.root_ang_vel_b[:, 2:3] ,
-                    self._commands,
-                    ## -- Local -- ##
-                    self.robot.data.joint_pos[: , self.fr_indices] ,
-                    self.robot.data.joint_vel[: , self.fr_indices] ,
-                ),
-                dim=-1                
-            ),
-            "hl_leg" : torch.cat(
-                (
-                    ## -- Global -- ##
-                    self.robot.data.root_lin_vel_b[:,:2] ,
-                    self.robot.data.root_ang_vel_b[:, 2:3] ,
-                    self._commands,
-                    ## -- Local -- ##
-                    self.robot.data.joint_pos[: , self.hl_indices] ,
-                    self.robot.data.joint_vel[: , self.hl_indices] ,
-                ),
-                dim=-1                
-            ),
-            "hr_leg" : torch.cat(
-                (
-                    ## -- Global -- ##
-                    self.robot.data.root_lin_vel_b[:,:2] ,
-                    self.robot.data.root_ang_vel_b[:, 2:3] ,
-                    self._commands,
-                    ## -- Local -- ##
-                    self.robot.data.joint_pos[: , self.hr_indices] ,
-                    self.robot.data.joint_vel[: , self.hr_indices] ,
-                ),
-                dim=-1                
-            ),
-        }
-        return observations
+                dim=-1                   
+            )
+        obs = {"policy" : observations}
+        return obs
 
-    def _get_dones(self) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:        
+    def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:        
         self._compute_intermediate_values()
         truncate = self.episode_length_buf >= self.max_episode_length - 1
         terminate = self.torso_position[:, 2] < self.cfg.termination_height
+        # print(terminate)
+        # print(truncate)
+        # print('*'*30)
 
-        terminates = {agent : terminate for agent in self.cfg.possible_agents}
-        truncates = {agent : truncate for agent in self.cfg.possible_agents}
-        print(terminate)
-        print(truncate)
-        print('*'*30)
-
-        return terminates, truncates
+        return terminate, truncate
     
-    def _reset_idx(self, env_ids: Sequence[int] | None):
+    def _reset_idx(self, env_ids: torch.Tensor | None):
         if env_ids is None or len(env_ids) == self.num_envs:
             env_ids = self.robot._ALL_INDICES
+        self.robot.reset(env_ids)
         super()._reset_idx(env_ids)
 
-        # for leg in self.actions:
-        #     self.actions[leg][env_ids] = 0.0
         joint_pos = self.robot.data.default_joint_pos[env_ids]
         joint_vel = self.robot.data.default_joint_vel[env_ids]
-
         default_root_state = self.robot.data.default_root_state[env_ids]
         default_root_state[:, :3] += self.scene.env_origins[env_ids]
 
         self.robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
         self.robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
-        # clear out any old actions for those envs:
-        self._commands[env_ids] = torch.zeros_like(self._commands[env_ids]).uniform_(-1.0, 1.0) # Curriculum add here
-        
+
+        # to_target = self.targets[env_ids] - default_root_state[:, :3]
+        # to_target[:, 2] = 0.0
+        # self.potentials[env_ids] = -torch.norm(to_target, p=2, dim=-1) / self.cfg.sim.dt
+
         self._compute_intermediate_values()
 
-    def _get_rewards(self) -> dict[str, torch.Tensor]:
+    def _get_rewards(self) -> torch.Tensor:
         rew_global = torch.tensor(0)
 
         lin_vel_error = torch.sum(torch.square(self._commands[:, :2] - self.robot.data.root_lin_vel_b[:, :2]), dim=1)
@@ -301,12 +209,8 @@ class AntLegEnv(DirectMARLEnv):
         yaw_error_mapped = torch.exp(-yaw_error / 0.25)
 
         rew_global = lin_vel_error_mapped * self.cfg.tracking_lin_vel_weight + yaw_error_mapped * self.cfg.yaw_weight
-        return {
-            "fl_leg" : rew_global , 
-            "fr_leg" : rew_global , 
-            "hl_leg" : rew_global , 
-            "hr_leg" : rew_global , 
-            }
+        return rew_global
+    
 # @torch.jit.script
 # def compute_intermediate_values(
 #     targets: torch.Tensor,
