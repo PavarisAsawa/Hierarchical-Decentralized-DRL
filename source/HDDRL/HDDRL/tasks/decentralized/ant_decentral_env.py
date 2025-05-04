@@ -264,9 +264,9 @@ class AntLegEnv(DirectMARLEnv):
 
         terminates = {agent : terminate for agent in self.cfg.possible_agents}
         truncates = {agent : truncate for agent in self.cfg.possible_agents}
-        print(terminate)
-        print(truncate)
-        print('*'*30)
+        # print(terminate)
+        # print(truncate)
+        # print('*'*30)
 
         return terminates, truncates
     
