@@ -34,8 +34,8 @@ class SlalomPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     # === Runner settings ===
     experiment_name = "decentral"
     num_steps_per_env = 24
-    max_iterations = 1000
-    save_interval = 50
+    max_iterations = 1500
+    save_interval = 100
     empirical_normalization = False
 
     # === Policy Network ===
