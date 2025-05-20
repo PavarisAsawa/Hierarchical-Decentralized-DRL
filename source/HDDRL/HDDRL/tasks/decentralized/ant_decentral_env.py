@@ -481,7 +481,7 @@ class AntLegEnv(DirectMARLEnv):
             self.goal_vel_visualizer.set_visibility(True)
             self.current_vel_visualizer.set_visibility(True)
         else:
-                self.goal_pos_visualizer.set_visibility(False)
+            self.goal_pos_visualizer.set_visibility(False)
 
     # def _debug_vis_callback(self, event):
     #     # update the markers
