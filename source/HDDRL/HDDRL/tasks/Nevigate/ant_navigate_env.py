@@ -34,7 +34,7 @@ import isaacsim.core.utils.torch as torch_utils
 
 # LOW_LEVEL = AntLegEnvCfg()
 @configclass
-class AntHighLevelCfg(DirectRLEnvCfg):
+class AntNavigateCfg(DirectRLEnvCfg):
     # env
     episode_length_s = 15.0
     decimation = 2
@@ -113,10 +113,10 @@ class AntHighLevelCfg(DirectRLEnvCfg):
     contact_force_scale: float = 0.1
 
 
-class AntHighLevelEnv(DirectRLEnv):
-    cfg : AntHighLevelCfg
+class AntNavigateEnv(DirectRLEnv):
+    cfg : AntNavigateCfg
 
-    def __init__(self, cfg: AntHighLevelCfg, render_mode: str | None = None, **kwargs):
+    def __init__(self, cfg: AntNavigateCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
         # robot properties
         self.action_scale = self.cfg.action_scale
@@ -267,15 +267,19 @@ class AntHighLevelEnv(DirectRLEnv):
         # ------------------- Global ------------------- #
         # Target Error
         target = torch.norm(self._commands - self.pos_env , dim=1)
-        target_reward = 1-torch.tanh(target / 1.5)
-        rewards = {
-            "target": target_reward,
-        }
-        # Logging
-        # for key, value in rewards.items():
-        #     self._episode_sums[key] += value
-        rew = torch.zeros(self.num_envs)
-        return -target
+        lin_vel_error = torch.sum(torch.square(self._commands[:, :2] - self.robot.data.root_lin_vel_b[:, :2]), dim=1)
+        lin_vel_error_mapped = torch.exp(-lin_vel_error / 0.25) * self.cfg.tracking_lin_vel_weight
+        up_reward = torch.zeros(self.num_envs , device=self.sim.device)
+        up_reward = torch.where(self.robot.data.projected_gravity_b[: , 2] > -0.9, torch.abs(self.robot.data.projected_gravity_b[: , 2]) * self.cfg.up_weight, up_reward)
+        alive_reward = torch.ones(self.num_envs ,device=self.sim.device) * self.cfg.alive_reward_scale * 0.0
+        action_rew = torch.sum(torch.abs(self.actions), dim=1) * self.cfg.actions_cost_scale
+        electricity_cost = torch.sum(torch.abs(self.actions * self.dof_vel * self.cfg.dof_vel_scale) * self.motor_effort_ratio.unsqueeze(0),dim=-1,) * self.cfg.energy_cost_scale
+        dof_at_limit_cost = torch.sum(self.dof_pos_scaled > 0.98, dim=-1)  * self.cfg.dof_at_limit_scale
+
+        rew_global = lin_vel_error_mapped  + up_reward  + alive_reward + action_rew + electricity_cost + dof_at_limit_cost - target
+
+        rew = torch.where(self.reset_buf, torch.ones_like(rew_global) * self.cfg.death_cost, rew_global)
+        return rew
     
     def _get_foot_status(self):
         f = self.scene["contact_sensor"].data.net_forces_w  # shape (num_envs, 4, 3)

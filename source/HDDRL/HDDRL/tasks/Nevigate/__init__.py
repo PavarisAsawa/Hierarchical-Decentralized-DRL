@@ -7,13 +7,12 @@ import gymnasium as gym
 from . import agents
 
 gym.register(
-    id='highlevel',
-    entry_point=f"{__name__}.ant_highlevel_env:AntHighLevelEnv",
+    id='navigate',
+    entry_point=f"{__name__}.ant_navigate_env:AntNavigateEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.ant_highlevel_env:AntHighLevelCfg",
-        # "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:DecenNavigationEnvPPORunnerCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:CenNavigationEnvPPORunnerCfg",
+        "env_cfg_entry_point": f"{__name__}.ant_navigate_env:AntNavigateCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:NavigationEnvPPORunnerCfg",
     },
 )
 

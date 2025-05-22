@@ -354,7 +354,7 @@ class AntLegEnv(DirectMARLEnv):
         self.robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
         # clear out any old actions for those envs:
-        self._commands[env_ids] = torch.zeros_like(self._commands[env_ids]).uniform_(-1.5, 1.5) # Curriculum add here
+        self._commands[env_ids] = torch.zeros_like(self._commands[env_ids]).uniform_(-5, 5) # Curriculum add here
         self._compute_intermediate_values()
 
         # Logging

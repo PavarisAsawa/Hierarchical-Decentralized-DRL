@@ -1,0 +1,700 @@
+# Copyright (c) 2021-2025, ETH Zurich and NVIDIA CORPORATION
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+from __future__ import annotations
+
+import os
+import statistics
+import time
+import torch
+from collections import deque
+
+import rsl_rl
+from rsl_rl.algorithms import PPO, Distillation
+from rsl_rl.env import VecEnv
+from rsl_rl.modules import (
+    ActorCritic,
+    ActorCriticRecurrent,
+    EmpiricalNormalization,
+    StudentTeacher,
+    StudentTeacherRecurrent,
+)
+from rsl_rl.utils import store_code_state
+import copy
+
+
+class OnPolicyRunner:
+    """On-policy runner for training and evaluation."""
+
+    def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device="cpu"):
+        self.cfg = train_cfg
+        self.alg_cfg = train_cfg["algorithm"]
+        self.policy_cfg = train_cfg["policy"]
+        self.alg_low_cfg = train_cfg["algorithm_low"]
+        self.policy_low_cfg = train_cfg["policy_low"]
+        self.device = device
+        self.env = env
+
+        # check if multi-gpu is enabled
+        self._configure_multi_gpu()
+
+        # resolve training type depending on the algorithm
+        if self.alg_cfg["class_name"] == "PPO":
+            self.training_type = "rl"
+        elif self.alg_cfg["class_name"] == "Distillation":
+            self.training_type = "distillation"
+        else:
+            raise ValueError(f"Training type not found for algorithm {self.alg_cfg['class_name']}.")
+
+        # resolve dimensions of observations
+        obs,_ = self.env.reset()
+        self.num_high_actions = 2
+        dummy_high_action = torch.zeros((env.num_envs, self.num_high_actions)).to(self.device) #action is vx, vy
+        self.high_action = torch.zeros((env.num_envs, self.num_high_actions)).to(self.device)
+        self.prev_high_action = torch.zeros((env.num_envs, self.num_high_actions)).to(self.device)
+        dummy_low_action = torch.zeros((env.num_envs, env.num_actions)).to(self.device)
+        obs, _, _, infos = self.env.step(dummy_low_action)
+        extras = infos
+        # obs, extras = self.env.get_observations()
+
+        #setting up the low level agents
+        self.max_action_change = 0.3
+        self.low_agent_names = ["fl_leg" , "fr_leg" , "hl_leg" , "hr_leg"]
+        self.fl_indices = [0,4]
+        self.fr_indices = [1,5]
+        self.hl_indices = [2,6]
+        self.hr_indices = [3,7]
+
+        obs_high, obs_low = self.extract_obs(obs, dummy_high_action)
+        num_obs_high = obs_high.shape[1]
+        num_obs_low = obs_low["fl_leg"].shape[1]
+        self.low_policies = {}
+
+        # resolve type of privileged observations
+        if self.training_type == "rl":
+            if "critic" in extras["observations"]:
+                self.privileged_obs_type = "critic"  # actor-critic reinforcement learnig, e.g., PPO
+            else:
+                self.privileged_obs_type = None
+        if self.training_type == "distillation":
+            if "teacher" in extras["observations"]:
+                self.privileged_obs_type = "teacher"  # policy distillation
+            else:
+                self.privileged_obs_type = None
+
+        # resolve dimensions of privileged observations
+        if self.privileged_obs_type is not None:
+            num_privileged_obs = extras["observations"][self.privileged_obs_type].shape[1]
+        else:
+            num_privileged_obs = num_obs_high
+
+        # evaluate the policy class
+        policy_class = eval(self.policy_cfg.pop("class_name"))
+        policy: ActorCritic | ActorCriticRecurrent | StudentTeacher | StudentTeacherRecurrent = policy_class(
+            num_obs_high, num_privileged_obs, self.num_high_actions, **self.policy_cfg
+        ).to(self.device)
+
+        # resolve dimension of rnd gated state
+        if "rnd_cfg" in self.alg_cfg and self.alg_cfg["rnd_cfg"] is not None:
+            # check if rnd gated state is present
+            rnd_state = extras["observations"].get("rnd_state")
+            if rnd_state is None:
+                raise ValueError("Observations for the key 'rnd_state' not found in infos['observations'].")
+            # get dimension of rnd gated state
+            num_rnd_state = rnd_state.shape[1]
+            # add rnd gated state to config
+            self.alg_cfg["rnd_cfg"]["num_states"] = num_rnd_state
+            # scale down the rnd weight with timestep (similar to how rewards are scaled down in legged_gym envs)
+            self.alg_cfg["rnd_cfg"]["weight"] *= env.unwrapped.step_dt
+
+        # if using symmetry then pass the environment config object
+        if "symmetry_cfg" in self.alg_cfg and self.alg_cfg["symmetry_cfg"] is not None:
+            # this is used by the symmetry function for handling different observation terms
+            self.alg_cfg["symmetry_cfg"]["_env"] = env
+
+        # initialize algorithm
+        alg_class = eval(self.alg_cfg.pop("class_name"))
+        print(f"Algorithm class: {alg_class}")
+        self.alg: PPO | Distillation = alg_class(policy, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg)
+
+
+        self.alg_low = {}  # Dict to hold one PPO per agent
+        self.policies_low = {}
+        alg_low_class = eval(self.alg_low_cfg["class_name"])
+        for agent in self.low_agent_names:
+            policy_cfg_copy = copy.deepcopy(self.policy_low_cfg)
+            policy_cfg_copy.pop("class_name", None)
+            alg_cfg_copy = copy.deepcopy(self.alg_low_cfg)
+            alg_cfg_copy.pop("class_name", None)
+            policy_low: ActorCritic | ActorCriticRecurrent | StudentTeacher | StudentTeacherRecurrent = policy_class(
+                num_obs_low, num_obs_low, 2, **policy_cfg_copy
+            ).to(self.device)
+            self.policies_low[agent] = policy_low
+
+            if "symmetry_cfg" in alg_cfg_copy and alg_cfg_copy["symmetry_cfg"] is not None:
+                # this is used by the symmetry function for handling different observation terms
+                alg_cfg_copy["symmetry_cfg"]["_env"] = env
+
+            # initialize algorithm
+            alg_low: PPO | Distillation = alg_low_class(policy_low, device=self.device, **alg_cfg_copy, multi_gpu_cfg=self.multi_gpu_cfg)
+            self.alg_low[agent] = alg_low
+
+        # store training configuration
+        self.num_steps_per_env = self.cfg["num_steps_per_env"]
+        self.save_interval = self.cfg["save_interval"]
+        self.empirical_normalization = self.cfg["empirical_normalization"]
+        if self.empirical_normalization:
+            self.obs_normalizer = EmpiricalNormalization(shape=[num_obs_high], until=1.0e8).to(self.device)
+            self.privileged_obs_normalizer = EmpiricalNormalization(shape=[num_privileged_obs], until=1.0e8).to(
+                self.device
+            )
+        else:
+            self.obs_normalizer = torch.nn.Identity().to(self.device)  # no normalization
+            self.privileged_obs_normalizer = torch.nn.Identity().to(self.device)  # no normalization
+
+        # init storage and model
+        self.alg.init_storage(
+            self.training_type,
+            self.env.num_envs,
+            self.num_steps_per_env,
+            [num_obs_high],
+            [num_privileged_obs],
+            [self.num_high_actions],
+        )
+
+        # Decide whether to disable logging
+        # We only log from the process with rank 0 (main process)
+        self.disable_logs = self.is_distributed and self.gpu_global_rank != 0
+        # Logging
+        self.log_dir = log_dir
+        self.writer = None
+        self.tot_timesteps = 0
+        self.tot_time = 0
+        self.current_learning_iteration = 0
+        self.git_status_repos = [rsl_rl.__file__]
+
+    def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):  # noqa: C901
+        # initialize writer
+        if self.log_dir is not None and self.writer is None and not self.disable_logs:
+            # Launch either Tensorboard or Neptune & Tensorboard summary writer(s), default: Tensorboard.
+            self.logger_type = self.cfg.get("logger", "tensorboard")
+            self.logger_type = self.logger_type.lower()
+
+            if self.logger_type == "neptune":
+                from rsl_rl.utils.neptune_utils import NeptuneSummaryWriter
+
+                self.writer = NeptuneSummaryWriter(log_dir=self.log_dir, flush_secs=10, cfg=self.cfg)
+                self.writer.log_config(self.env.cfg, self.cfg, self.alg_cfg, self.policy_cfg)
+            elif self.logger_type == "wandb":
+                from rsl_rl.utils.wandb_utils import WandbSummaryWriter
+
+                self.writer = WandbSummaryWriter(log_dir=self.log_dir, flush_secs=10, cfg=self.cfg)
+                self.writer.log_config(self.env.cfg, self.cfg, self.alg_cfg, self.policy_cfg)
+            elif self.logger_type == "tensorboard":
+                from torch.utils.tensorboard import SummaryWriter
+
+                self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
+            else:
+                raise ValueError("Logger type not found. Please choose 'neptune', 'wandb' or 'tensorboard'.")
+
+        # check if teacher is loaded
+        if self.training_type == "distillation" and not self.alg.policy.loaded_teacher:
+            raise ValueError("Teacher model parameters not loaded. Please load a teacher model to distill.")
+
+        # randomize initial episode lengths (for exploration)
+        if init_at_random_ep_len:
+            self.env.episode_length_buf = torch.randint_like(
+                self.env.episode_length_buf, high=int(self.env.max_episode_length)
+            )
+
+        # start learning
+        # obs, extras = self.env.get_observations()
+        obs = self.env.reset()
+        dummy_high_action = torch.zeros((self.env.num_envs, self.num_high_actions)).to(self.device) #action is vx, vy
+        dummy_low_action = torch.zeros((self.env.num_envs, self.env.num_actions)).to(self.device)
+        obs, _, _, infos = self.env.step(dummy_low_action)
+        extras = infos
+        privileged_obs = extras["observations"].get(self.privileged_obs_type, obs)
+        obs, privileged_obs = obs.to(self.device), privileged_obs.to(self.device)
+        self.train_mode()  # switch to train mode (for dropout for example)
+        
+        obs, _, _, infos = self.env.step(dummy_low_action)
+        extras = infos
+        # obs, extras = self.env.get_observations()
+        obs_high, obs_low = self.extract_obs(obs, dummy_high_action)
+
+        # Book keeping
+        ep_infos = []
+        rewbuffer = deque(maxlen=100)
+        lenbuffer = deque(maxlen=100)
+        cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+        cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+
+        # create buffers for logging extrinsic and intrinsic rewards
+        if self.alg.rnd:
+            erewbuffer = deque(maxlen=100)
+            irewbuffer = deque(maxlen=100)
+            cur_ereward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+            cur_ireward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+
+        # Ensure all parameters are in-synced
+        if self.is_distributed:
+            print(f"Synchronizing parameters for rank {self.gpu_global_rank}...")
+            self.alg.broadcast_parameters()
+            # TODO: Do we need to synchronize empirical normalizers?
+            #   Right now: No, because they all should converge to the same values "asymptotically".
+
+        # Start training
+        start_iter = self.current_learning_iteration
+        tot_iter = start_iter + num_learning_iterations
+        prev_high_action = torch.zeros((self.env.num_envs, self.num_high_actions)).to(self.device)
+        dummy_high_action = torch.ones((self.env.num_envs, self.num_high_actions)).to(self.device) #action is vx, vy
+        for it in range(start_iter, tot_iter):
+            start = time.time()
+            # Rollout
+            with torch.inference_mode():
+                for _ in range(self.num_steps_per_env):
+                    # Sample actions
+                    actions = {}
+                    for agent in self.low_agent_names:
+                        actions[agent] = self.low_policies[agent](obs_low[agent])
+                    # actions = torch.cat(list(actions.values()), dim=1)
+                    stacked = torch.stack(list(actions.values()), dim=2)
+                    actions = stacked.view(stacked.size(0), -1)
+                    # Step the environment
+                    obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
+                    # Move to device
+                    obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
+                    # perform normalization
+                    obs = self.obs_normalizer(obs)
+                    high_action = self.alg.act(obs_high, obs_high)
+                    high_action = torch.clamp(torch.tensor(high_action), min = -1.5, max = 1.5)
+                    # Compute delta
+                    delta = high_action - prev_high_action
+                    # Clamp the delta
+                    delta_clipped = torch.clamp(delta, -self.max_action_change, self.max_action_change)
+                    # Compute the new action
+                    # smoothed_action = prev_high_action + delta_clipped
+                    smoothed_action = 0.1*high_action + 0.9*prev_high_action 
+
+                    # print(f"high_action: {high_action}")
+                    obs_high, obs_low = self.extract_obs(obs, smoothed_action)
+                    prev_high_action = high_action
+                    # if self.privileged_obs_type is not None:
+                    #     privileged_obs = self.privileged_obs_normalizer(
+                    #         infos["observations"][self.privileged_obs_type].to(self.device)
+                    #     )
+                    # else:
+                    #     privileged_obs = obs
+
+                    # process the step
+                    self.alg.process_env_step(rewards, dones, infos)
+
+                    # Extract intrinsic rewards (only for logging)
+                    intrinsic_rewards = self.alg.intrinsic_rewards if self.alg.rnd else None
+
+                    # book keeping
+                    if self.log_dir is not None:
+                        if "episode" in infos:
+                            ep_infos.append(infos["episode"])
+                        elif "log" in infos:
+                            ep_infos.append(infos["log"])
+                        # Update rewards
+                        if self.alg.rnd:
+                            cur_ereward_sum += rewards
+                            cur_ireward_sum += intrinsic_rewards  # type: ignore
+                            cur_reward_sum += rewards + intrinsic_rewards
+                        else:
+                            cur_reward_sum += rewards
+                        # Update episode length
+                        cur_episode_length += 1
+                        # Clear data for completed episodes
+                        # -- common
+                        new_ids = (dones > 0).nonzero(as_tuple=False)
+                        rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                        lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
+                        cur_reward_sum[new_ids] = 0
+                        cur_episode_length[new_ids] = 0
+                        # -- intrinsic and extrinsic rewards
+                        if self.alg.rnd:
+                            erewbuffer.extend(cur_ereward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                            irewbuffer.extend(cur_ireward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                            cur_ereward_sum[new_ids] = 0
+                            cur_ireward_sum[new_ids] = 0
+
+                stop = time.time()
+                collection_time = stop - start
+                start = stop
+
+                # compute returns
+                if self.training_type == "rl":
+                    self.alg.compute_returns(obs_high)
+
+            # update policy
+            loss_dict = self.alg.update()
+
+            stop = time.time()
+            learn_time = stop - start
+            self.current_learning_iteration = it
+            # log info
+            if self.log_dir is not None and not self.disable_logs:
+                # Log information
+                self.log(locals())
+                # Save model
+                if it % self.save_interval == 0:
+                    self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
+
+            # Clear episode infos
+            ep_infos.clear()
+            # Save code state
+            # if it == start_iter and not self.disable_logs:
+            #     # obtain all the diff files
+            #     git_file_paths = store_code_state(self.log_dir, self.git_status_repos)
+            #     # if possible store them to wandb
+            #     if self.logger_type in ["wandb", "neptune"] and git_file_paths:
+            #         for path in git_file_paths:
+            #             self.writer.save_file(path)
+
+        # Save the final model after training
+        if self.log_dir is not None and not self.disable_logs:
+            self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
+
+    def log(self, locs: dict, width: int = 80, pad: int = 35):
+        # Compute the collection size
+        collection_size = self.num_steps_per_env * self.env.num_envs * self.gpu_world_size
+        # Update total time-steps and time
+        self.tot_timesteps += collection_size
+        self.tot_time += locs["collection_time"] + locs["learn_time"]
+        iteration_time = locs["collection_time"] + locs["learn_time"]
+
+        # -- Episode info
+        ep_string = ""
+        if locs["ep_infos"]:
+            for key in locs["ep_infos"][0]:
+                infotensor = torch.tensor([], device=self.device)
+                for ep_info in locs["ep_infos"]:
+                    # handle scalar and zero dimensional tensor infos
+                    if key not in ep_info:
+                        continue
+                    if not isinstance(ep_info[key], torch.Tensor):
+                        ep_info[key] = torch.Tensor([ep_info[key]])
+                    if len(ep_info[key].shape) == 0:
+                        ep_info[key] = ep_info[key].unsqueeze(0)
+                    infotensor = torch.cat((infotensor, ep_info[key].to(self.device)))
+                value = torch.mean(infotensor)
+                # log to logger and terminal
+                if "/" in key:
+                    self.writer.add_scalar(key, value, locs["it"])
+                    ep_string += f"""{f'{key}:':>{pad}} {value:.4f}\n"""
+                else:
+                    self.writer.add_scalar("Episode/" + key, value, locs["it"])
+                    ep_string += f"""{f'Mean episode {key}:':>{pad}} {value:.4f}\n"""
+
+        mean_std = self.alg.policy.action_std.mean()
+        fps = int(collection_size / (locs["collection_time"] + locs["learn_time"]))
+
+        # -- Losses
+        for key, value in locs["loss_dict"].items():
+            self.writer.add_scalar(f"Loss/{key}", value, locs["it"])
+        self.writer.add_scalar("Loss/learning_rate", self.alg.learning_rate, locs["it"])
+
+        # -- Policy
+        self.writer.add_scalar("Policy/mean_noise_std", mean_std.item(), locs["it"])
+
+        # -- Performance
+        self.writer.add_scalar("Perf/total_fps", fps, locs["it"])
+        self.writer.add_scalar("Perf/collection time", locs["collection_time"], locs["it"])
+        self.writer.add_scalar("Perf/learning_time", locs["learn_time"], locs["it"])
+
+        # -- Training
+        if len(locs["rewbuffer"]) > 0:
+            # separate logging for intrinsic and extrinsic rewards
+            if self.alg.rnd:
+                self.writer.add_scalar("Rnd/mean_extrinsic_reward", statistics.mean(locs["erewbuffer"]), locs["it"])
+                self.writer.add_scalar("Rnd/mean_intrinsic_reward", statistics.mean(locs["irewbuffer"]), locs["it"])
+                self.writer.add_scalar("Rnd/weight", self.alg.rnd.weight, locs["it"])
+            # everything else
+            self.writer.add_scalar("Train/mean_reward", statistics.mean(locs["rewbuffer"]), locs["it"])
+            self.writer.add_scalar("Train/mean_episode_length", statistics.mean(locs["lenbuffer"]), locs["it"])
+            if self.logger_type != "wandb":  # wandb does not support non-integer x-axis logging
+                self.writer.add_scalar("Train/mean_reward/time", statistics.mean(locs["rewbuffer"]), self.tot_time)
+                self.writer.add_scalar(
+                    "Train/mean_episode_length/time", statistics.mean(locs["lenbuffer"]), self.tot_time
+                )
+
+        str = f" \033[1m Learning iteration {locs['it']}/{locs['tot_iter']} \033[0m "
+
+        if len(locs["rewbuffer"]) > 0:
+            log_string = (
+                f"""{'#' * width}\n"""
+                f"""{str.center(width, ' ')}\n\n"""
+                f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs[
+                    'collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
+                f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
+            )
+            # -- Losses
+            for key, value in locs["loss_dict"].items():
+                log_string += f"""{f'Mean {key} loss:':>{pad}} {value:.4f}\n"""
+            # -- Rewards
+            if self.alg.rnd:
+                log_string += (
+                    f"""{'Mean extrinsic reward:':>{pad}} {statistics.mean(locs['erewbuffer']):.2f}\n"""
+                    f"""{'Mean intrinsic reward:':>{pad}} {statistics.mean(locs['irewbuffer']):.2f}\n"""
+                )
+            log_string += f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
+            # -- episode info
+            log_string += f"""{'Mean episode length:':>{pad}} {statistics.mean(locs['lenbuffer']):.2f}\n"""
+        else:
+            log_string = (
+                f"""{'#' * width}\n"""
+                f"""{str.center(width, ' ')}\n\n"""
+                f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs[
+                    'collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
+                f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
+            )
+            for key, value in locs["loss_dict"].items():
+                log_string += f"""{f'{key}:':>{pad}} {value:.4f}\n"""
+
+        log_string += ep_string
+        log_string += (
+            f"""{'-' * width}\n"""
+            f"""{'Total timesteps:':>{pad}} {self.tot_timesteps}\n"""
+            f"""{'Iteration time:':>{pad}} {iteration_time:.2f}s\n"""
+            f"""{'Time elapsed:':>{pad}} {time.strftime("%H:%M:%S", time.gmtime(self.tot_time))}\n"""
+            f"""{'ETA:':>{pad}} {time.strftime("%H:%M:%S", time.gmtime(self.tot_time / (locs['it'] - locs['start_iter'] + 1) * (
+                               locs['start_iter'] + locs['num_learning_iterations'] - locs['it'])))}\n"""
+        )
+        print(log_string)
+
+    def save(self, path: str, infos=None):
+        # -- Save model
+        saved_dict = {
+            "model_state_dict": self.alg.policy.state_dict(),
+            "optimizer_state_dict": self.alg.optimizer.state_dict(),
+            "iter": self.current_learning_iteration,
+            "infos": infos,
+        }
+        # -- Save RND model if used
+        if self.alg.rnd:
+            saved_dict["rnd_state_dict"] = self.alg.rnd.state_dict()
+            saved_dict["rnd_optimizer_state_dict"] = self.alg.rnd_optimizer.state_dict()
+        # -- Save observation normalizer if used
+        if self.empirical_normalization:
+            saved_dict["obs_norm_state_dict"] = self.obs_normalizer.state_dict()
+            saved_dict["privileged_obs_norm_state_dict"] = self.privileged_obs_normalizer.state_dict()
+
+        # save model
+        torch.save(saved_dict, path)
+
+        # upload model to external logging service
+        if self.logger_type in ["neptune", "wandb"] and not self.disable_logs:
+            self.writer.save_model(path, self.current_learning_iteration)
+
+    def load(self, path: str, load_optimizer: bool = True):
+        loaded_dict = torch.load(path, weights_only=False)
+        # -- Load model
+        resumed_training = self.alg.policy.load_state_dict(loaded_dict["model_state_dict"])
+        # -- Load RND model if used
+        if self.alg.rnd:
+            self.alg.rnd.load_state_dict(loaded_dict["rnd_state_dict"])
+        # -- Load observation normalizer if used
+        if self.empirical_normalization:
+            if resumed_training:
+                # if a previous training is resumed, the actor/student normalizer is loaded for the actor/student
+                # and the critic/teacher normalizer is loaded for the critic/teacher
+                self.obs_normalizer.load_state_dict(loaded_dict["obs_norm_state_dict"])
+                self.privileged_obs_normalizer.load_state_dict(loaded_dict["privileged_obs_norm_state_dict"])
+            else:
+                # if the training is not resumed but a model is loaded, this run must be distillation training following
+                # an rl training. Thus the actor normalizer is loaded for the teacher model. The student's normalizer
+                # is not loaded, as the observation space could differ from the previous rl training.
+                self.privileged_obs_normalizer.load_state_dict(loaded_dict["obs_norm_state_dict"])
+        # -- load optimizer if used
+        if load_optimizer and resumed_training:
+            # -- algorithm optimizer
+            self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
+            # -- RND optimizer if used
+            if self.alg.rnd:
+                self.alg.rnd_optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
+        # -- load current learning iteration
+        if resumed_training:
+            self.current_learning_iteration = loaded_dict["iter"]
+        return loaded_dict["infos"]
+
+    def get_inference_policy(self, device=None):
+        self.eval_mode()  # switch to evaluation mode (dropout for example)
+        if device is not None:
+            self.alg.policy.to(device)
+        policy = self.alg.policy.act_inference
+        if self.cfg["empirical_normalization"]:
+            if device is not None:
+                self.obs_normalizer.to(device)
+            policy = lambda x: self.alg.policy.act_inference(self.obs_normalizer(x))  # noqa: E731
+        return policy
+
+    def train_mode(self):
+        # -- PPO
+        self.alg.policy.train()
+        # -- RND
+        if self.alg.rnd:
+            self.alg.rnd.train()
+        # -- Normalization
+        if self.empirical_normalization:
+            self.obs_normalizer.train()
+            self.privileged_obs_normalizer.train()
+
+    def eval_mode(self):
+        # -- PPO
+        self.alg.policy.eval()
+        # -- RND
+        if self.alg.rnd:
+            self.alg.rnd.eval()
+        # -- Normalization
+        if self.empirical_normalization:
+            self.obs_normalizer.eval()
+            self.privileged_obs_normalizer.eval()
+
+    def add_git_repo_to_log(self, repo_file_path):
+        self.git_status_repos.append(repo_file_path)
+
+    """
+    Helper functions.
+    """
+
+    def _configure_multi_gpu(self):
+        """Configure multi-gpu training."""
+        # check if distributed training is enabled
+        self.gpu_world_size = int(os.getenv("WORLD_SIZE", "1"))
+        self.is_distributed = self.gpu_world_size > 1
+
+        # if not distributed training, set local and global rank to 0 and return
+        if not self.is_distributed:
+            self.gpu_local_rank = 0
+            self.gpu_global_rank = 0
+            self.multi_gpu_cfg = None
+            return
+
+        # get rank and world size
+        self.gpu_local_rank = int(os.getenv("LOCAL_RANK", "0"))
+        self.gpu_global_rank = int(os.getenv("RANK", "0"))
+
+        # make a configuration dictionary
+        self.multi_gpu_cfg = {
+            "global_rank": self.gpu_global_rank,  # rank of the main process
+            "local_rank": self.gpu_local_rank,  # rank of the current process
+            "world_size": self.gpu_world_size,  # total number of processes
+        }
+
+        # check if user has device specified for local rank
+        if self.device != f"cuda:{self.gpu_local_rank}":
+            raise ValueError(f"Device '{self.device}' does not match expected device for local rank '{self.gpu_local_rank}'.")
+        # validate multi-gpu configuration
+        if self.gpu_local_rank >= self.gpu_world_size:
+            raise ValueError(f"Local rank '{self.gpu_local_rank}' is greater than or equal to world size '{self.gpu_world_size}'.")
+        if self.gpu_global_rank >= self.gpu_world_size:
+            raise ValueError(f"Global rank '{self.gpu_global_rank}' is greater than or equal to world size '{self.gpu_world_size}'.")
+
+        # initialize torch distributed
+        torch.distributed.init_process_group(
+            backend="nccl", rank=self.gpu_global_rank, world_size=self.gpu_world_size
+        )
+        # set device to the local rank
+        torch.cuda.set_device(self.gpu_local_rank)
+
+    #low level
+    def load_low_level(self, path: str, device=None):
+        loaded_dict = torch.load(path, weights_only=False)
+        agent_data = loaded_dict["agent_data"]
+        # -- Load model
+        for agent in self.low_agent_names:
+            self.alg_low[agent].policy.load_state_dict(agent_data[agent]["model_state_dict"])
+            self.alg_low[agent].policy.eval()
+            if device is not None:
+                self.alg_low[agent].policy.to(device)
+            self.low_policies[agent] = self.alg_low[agent].policy.act_inference
+    
+    def extract_obs(self, obs, high_action):
+        # obs_high = obs[:, :7]
+        # root_lin_vel = obs[:, 5:7]
+        # projected_gravity_b = obs[:, 7:10]
+        # foot_status = obs[:, 10:14]
+        # joint_pos = obs[:, 14:22]
+        # joint_vel = obs[:, 22:30]
+        obs_high = obs[:, :5]
+        root_lin_vel = obs[:, 3:5]
+        projected_gravity_b = obs[:, 5:8]
+        foot_status = obs[:, 8:12]
+        joint_pos = obs[:, 12:20]
+        joint_vel = obs[:, 20:28]
+        obs_low = {
+            "fl_leg" : torch.cat(
+                (
+                    ## -- Global -- ##
+                    root_lin_vel,
+                    projected_gravity_b,
+                    high_action,
+                    foot_status,
+                    ## -- Local -- ##
+                    joint_pos[: , self.fl_indices] ,
+                    joint_vel[: , self.fl_indices] ,
+                ),
+                dim=-1                
+            ),
+            "fr_leg" : torch.cat(
+                (
+                    ## -- Global -- ##
+                    root_lin_vel,
+                    projected_gravity_b,
+                    high_action,
+                    foot_status,
+                    ## -- Local -- ##
+                    joint_pos[: , self.fr_indices] ,
+                    joint_vel[: , self.fr_indices] ,
+                ),
+                dim=-1                
+            ),
+            "hl_leg" : torch.cat(
+                (
+                    ## -- Global -- ##
+                    root_lin_vel,
+                    projected_gravity_b,
+                    high_action,
+                    foot_status,
+                    ## -- Local -- ##
+                    joint_pos[: , self.hl_indices] ,
+                    joint_vel[: , self.hl_indices] ,
+                ),
+                dim=-1                
+            ),
+            "hr_leg" : torch.cat(
+                (
+                    ## -- Global -- ##
+                    root_lin_vel,
+                    projected_gravity_b,
+                    high_action,
+                    foot_status,
+                    ## -- Local -- ##
+                    joint_pos[: , self.hr_indices] ,
+                    joint_vel[: , self.hr_indices] ,
+                ),
+                dim=-1   
+            ),
+        }
+        return obs_high, obs_low
+
+    def get_actions(self, obs, policy):
+        self.prev_high_action = self.high_action
+        obs_high, obs_low = self.extract_obs(obs, self.high_action)
+        high_action = policy(obs_high)
+        high_action = torch.clamp(torch.tensor(high_action), min = -1.5, max = 1.5)
+        smoothed_action = 0.1*high_action + 0.9*self.prev_high_action 
+        self.high_action = smoothed_action
+
+        actions = {}
+        for agent in self.low_agent_names:
+            actions[agent] = self.low_policies[agent](obs_low[agent])
+        stacked = torch.stack(list(actions.values()), dim=2)
+        actions = stacked.view(stacked.size(0), -1)
+        return actions
