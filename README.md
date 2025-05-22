@@ -4,7 +4,6 @@
 
 ### Description of the project
 - In nature, control of movement happens in a hierarchical and decentralized fashion is a central characteristic of biological motor control that allows for fast responses relying on local sensory information. This motivates to ask whether decentralization as seen in biological control architectures might also be beneficial for embodied sensory-motor control systems when using DRL 
-- 
 
 ### Goal
 - The goal is to develop a Hierarchical Decentralized Deep Reinforcement Learning (HDDRL) architecture for a four-legged robot, where control is divided into two layers: 
@@ -42,7 +41,7 @@ git clone https://github.com/PavarisAsawa/Hierarchical-Decentralized-DRL.git
 
 ```bash
 # Enter the repository
-cd IsaacLabExtensionTemplate
+cd Hierarchical-Decentralized-DRL
 python -m pip install -e source/HDDRL
 ```
 
@@ -51,3 +50,24 @@ python -m pip install -e source/HDDRL
 ```bash
 python scripts/rsl_rl/train.py --task=Template-Isaac-Velocity-Rough-Anymal-D-v0
 ```
+
+## System Overview
+This project is contain with 2 level with controller
+- `High Level` : for navigation task
+- `Low Level` : for locomotion task
+    - for low level we can model as 2 type of controller is 
+    - Decentralized controller : we seperate policy to control each leg
+    - Centralize controller : all leg is controlled by only 1 policy
+
+<div style="text-align: center;">
+    <img src="images/architecture.png" alt="architecture" width="400"/>
+    <p><em>System Architecture (c : low level with centralized controller , d : low level with decentralized contoller)</em></p>
+    <p><em>source : https://arxiv.org/pdf/2210.08003</em></p>
+</div>
+
+
+## Training
+### Training : Low Level Decentralized
+### Training : Low Level Centralized
+### Training : High Level
+
