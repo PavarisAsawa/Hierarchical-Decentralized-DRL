@@ -15,15 +15,13 @@
 - Implement two-layer control architecture: 
     - High-Level Controller (HLC): Responsible for navigation decisions based on heuristic function (distance between agent and target). 
     - Low-Level Controller (LLC): Responsible for local locomotion control (standing, walking) using only local sensory inputs and HLC signals. 
-- Both HLC and LLC must be trained using model-free RL methods (e.g., PPO, A2C). 
+- Both HLC and LLC must be trained using PPO. 
 - Evaluate centralized vs decentralized policies in terms of robustness, adaptability, and performance in navigation tasks. 
 
 ### Scope
 - Using four-legged Ant robot model in Isaac lab environment. 
-- Using PPO and A2C for baseline algorithm. 
+- Using PPO for baseline algorithm. 
 - Compare LLC Centralize (4 legs in 1 agent) and fully-decentralize (separate all 4 legs) with centralize HLC. 
-- State observation is heuristic function (distance between agent and target) for HLC and joint state for LLC. 
-- Using Curriculum learning for training robots. 
 
 ## Installation
 
@@ -48,7 +46,7 @@ python -m pip install -e source/HDDRL
 - Verify that the extension is correctly installed by running the following command:
 
 ```bash
-python scripts/rsl_rl/train.py --task=Template-Isaac-Velocity-Rough-Anymal-D-v0
+python scripts/rsl_rl/train.py --task=central
 ```
 
 ## System Overview
@@ -68,6 +66,270 @@ This project is contain with 2 level with controller
 
 ## Training
 ### Training : Low Level Decentralized
-### Training : Low Level Centralized
-### Training : High Level
+For Low Level Decentralized we using IPPO algorithms which is each leg seperate agent but using same global or average reward for updating policy
 
+Observavtion space:
+- Global Observation (every leg have this Observation as same)
+    - Linear Velocity: Linear velocity of robot in x, y axis (size = 2)
+    - Projected Gravity: Direction of gravity force project to robot frame (size = 3)
+    - Velocity Command: Target velocity command in x, y axis in locomotion task (size = 2)
+    - Foot Contact: Contact sensor at all foot that tell each leg contact to floor or not (size = 4)
+- Local Observation (each leg have just itself leg observation)
+    - Joint Position: position of each joint on leg (size = 2)
+    - Joint Velocity: velocity of each joint on leg (size = 2) 
+- Size of observation space is 15 for each leg.
+
+Reward:
+- Linear Velocity: Reward given that robot velocity close to target velocity
+```
+lin_vel_error = torch.sum(torch.square(self._commands[:, :2] - self.robot.data.root_lin_vel_b[:, :2]), dim=1)
+lin_vel_error_mapped = torch.exp(-lin_vel_error / 0.25) * self.cfg.tracking_lin_vel_weight
+```
+- Upright Posture: Reward given that robot robot stand straight
+```
+up_reward = torch.zeros(self.num_envs , device=self.sim.device)
+up_reward = torch.where(self.robot.data.projected_gravity_b[: , 2] > -0.9, torch.abs(self.robot.data.projected_gravity_b[: , 2]) * self.cfg.up_weight, up_reward)
+```
+- Action: Reward given when robot do an action
+```
+fl_action = torch.sum(torch.square(self.actions["fl_leg"]), dim=1) * self.cfg.actions_cost_scale
+```
+- Electricity: Reward given when robot make an electricity
+```
+ fl_electricity_cost = torch.sum(torch.abs(self.actions["fl_leg"] * self.dof_vel[: , self.fl_indices] * self.cfg.dof_vel_scale) * self.motor_effort_ratio[:2].unsqueeze(0),dim=-1,) * self.cfg.energy_cost_scale
+```
+- DoF at Limit: Reward given that robot joint position more than minimum
+```
+fl_dof_at_limit_cost = torch.sum(self.dof_pos_scaled[: , self.fl_indices] > 0.98, dim=-1) * self.cfg.dof_at_limit_scale
+```
+
+For reward Action, Electricity and DoF at Limit there are local reward which is each agent(leg) calculate seperate and return seperate reward
+
+For IPPO algorithm so reward will average to make global reward that use for update each leg policy
+
+Agent: Each leg using seperate agent which is PPO base. Each leg have same hyper paprameter which is
+```
+experiment_name = "decentral"
+num_steps_per_env = 24
+max_iterations = 1500
+save_interval = 100
+empirical_normalization = False
+
+# === Policy Network ===
+policy = RslRlPpoActorCriticCfg(
+    init_noise_std=1.0,
+    actor_hidden_dims=[128, 128, 128],
+    critic_hidden_dims=[128, 128, 128],
+    activation="elu",
+)
+
+# === PPO Hyperparameters ===
+algorithm = RslRlPpoAlgorithmCfg(
+    value_loss_coef=1.0,
+    use_clipped_value_loss=True,
+    clip_param=0.2,
+    entropy_coef=0.005,
+    num_learning_epochs=5,
+    num_mini_batches=4,
+    learning_rate=3e-4,
+    schedule="adaptive",
+    gamma=0.99,
+    lam=0.95,
+    desired_kl=0.01,
+    max_grad_norm=1.0,
+)
+```
+### Training : Low Level Centralized
+For Low Level Centralized we using normal PPO algorithms
+
+Observavtion space:
+- Linear Velocity: Linear velocity of robot in x, y axis (size = 2)
+- Projected Gravity: Direction of gravity force project to robot frame (size = 3)
+- Velocity Command: Target velocity command in x, y axis in locomotion task (size = 2)
+- Foot Contact: Contact sensor at all foot that tell each leg contact to floor or not (size = 4)
+- Joint Position: position of each joint on leg (size = 8)
+- Joint Velocity: velocity of each joint on leg (size = 8) 
+
+Size of observation space is 27.
+
+Reward:
+- Linear Velocity: Reward given that robot velocity close to target velocity
+```
+lin_vel_error = torch.sum(torch.square(self._commands[:, :2] - self.robot.data.root_lin_vel_b[:, :2]), dim=1)
+lin_vel_error_mapped = torch.exp(-lin_vel_error / 0.25) * self.cfg.tracking_lin_vel_weight
+```
+- Upright Posture: Reward given that robot robot stand straight
+```
+up_reward = torch.zeros(self.num_envs , device=self.sim.device)
+up_reward = torch.where(self.robot.data.projected_gravity_b[: , 2] > -0.9, torch.abs(self.robot.data.projected_gravity_b[: , 2]) * self.cfg.up_weight, up_reward)
+```
+- Action: Reward given when robot do an action
+```
+action_rew = torch.sum(torch.square(self.actions), dim=1) * self.cfg.actions_cost_scale /4.0
+```
+- Electricity: Reward given when robot make an electricity
+```
+electricity_cost = torch.sum(torch.abs(self.actions * self.dof_vel * self.cfg.dof_vel_scale) * self.motor_effort_ratio.unsqueeze(0),dim=-1,) * self.cfg.energy_cost_scale / 4.0
+```
+- DoF at Limit: Reward given that robot joint position more than minimum
+```
+dof_at_limit_cost = torch.sum(self.dof_pos_scaled > 0.98, dim=-1)  * self.cfg.dof_at_limit_scale /4.0
+```
+
+For reward Action, Electricity and DoF at Limit there are local reward for decentralize so in central we sum all 4 leg and devide by 4 to calculate average from all leg.
+
+Agent: It's PPO base. And have hyper paprameter which is
+```
+num_steps_per_env = 24
+max_iterations = 1500
+save_interval = 100
+experiment_name = "central"
+empirical_normalization = False
+
+policy = RslRlPpoActorCriticCfg(
+    init_noise_std=1.0,
+    actor_hidden_dims=[512, 256, 128],
+    critic_hidden_dims=[512, 256, 128],
+    activation="elu",
+)
+algorithm = RslRlPpoAlgorithmCfg(
+    value_loss_coef=1.0,
+    use_clipped_value_loss=True,
+    clip_param=0.2,
+    entropy_coef=0.005,
+    num_learning_epochs=5,
+    num_mini_batches=4,
+    learning_rate=3e-4,
+    schedule="adaptive",
+    gamma=0.99,
+    lam=0.95,
+    desired_kl=0.01,
+    max_grad_norm=1.0,
+)
+```
+### Training : High Level
+In high level it have objective to nevigate robot to target postion.
+
+Observavtion space:
+- Heading: direction that robot heading to (yaw angle) (size = 1)
+- Distance: Distance from robot to targ
+et position in x-y axis (size = 2)
+
+Size of observation space is 3.
+
+Reward:
+- Distance Penalty: Penalty given when robot position far from target position.
+```
+target = -torch.norm(self._commands - self.pos_env , dim=1)
+```
+
+Agent: It's PPO base. And have hyper paprameter which is (policy_low and algorithm_low is hyperparameter of low level should config to same as low level model)
+```
+num_steps_per_env = 8
+max_iterations = 1500
+save_interval = 50
+experiment_name = "Navigate_decen"
+empirical_normalization = False
+policy = RslRlPpoActorCriticCfg(
+    init_noise_std=0.5,
+    actor_hidden_dims=[128, 128],
+    critic_hidden_dims=[128, 128],
+    activation="elu",
+)
+algorithm = RslRlPpoAlgorithmCfg(
+    value_loss_coef=1.0,
+    use_clipped_value_loss=True,
+    clip_param=0.2,
+    entropy_coef=0.005,
+    num_learning_epochs=5,
+    num_mini_batches=4,
+    learning_rate=1.0e-3,
+    schedule="adaptive",
+    gamma=0.99,
+    lam=0.95,
+    desired_kl=0.01,
+    max_grad_norm=1.0,
+)
+
+# === Policy Network ===
+policy_low = RslRlPpoActorCriticCfg(
+    init_noise_std=1.0,
+    actor_hidden_dims=[128, 128, 128],
+    critic_hidden_dims=[128, 128, 128],
+    activation="elu",
+)
+
+# === PPO Hyperparameters ===
+algorithm_low = RslRlPpoAlgorithmCfg(
+    value_loss_coef=1.0,
+    use_clipped_value_loss=True,
+    clip_param=0.2,
+    entropy_coef=0.005,
+    num_learning_epochs=5,
+    num_mini_batches=4,
+    learning_rate=3e-4,
+    schedule="adaptive",
+    gamma=0.99,
+    lam=0.95,
+    desired_kl=0.01,
+    max_grad_norm=1.0,
+)
+```
+
+## Result
+### Result : Low Level
+Task Performance
+- centralized:
+<video controls src="images/cen.mp4" title="Title"></video>
+
+- decentralized:
+<video controls src="images/decen.mp4" title="Title"></video>
+
+From video we can see that centralized can do task more smooth than decentral. It can control velocity better and also have better walking posture.
+
+Compare in RL term:
+![alt text](images/low_result.png)
+![alt text](images/low_vel_error.png)
+
+From graph
+- episode length: Decentral have more episode length espacially at first which mean it learn to not terminate before do a locomotion task
+- reward: Decentral have more reward which can assume that it from others reward not from velocity error. And it also have more variance in decentral
+- Velocity error: we can see that it have higher variance for the decentralized policy. And more error than central
+
+**Conclude**
+Decentralized Learning:
+- Each leg is controlled independently, resulting in uneven usage—some legs contribute more to locomotion while others contribute less or remain inactive.
+- Because the legs do not share a common state or policy, the same leg may behave different when others leg not same state. It's make similar states need to do morre than 1 across episodes.
+- This leads to higher variance in velocity errors, as shown in the graphs.
+
+Centralized Learning:
+- All four legs operate under a shared policy and have full state information, enabling more synchronized movement.
+- This consistent coordination results in lower velocity errors and less variance, leading to more stable and reliable behavior.
+
+### Result : High Level
+Task Performance
+- centralized:
+<video controls src="images/Navigate_cen.mp4" title="Title"></video>
+
+- decentralized:
+<video controls src="images/Navigate_decen.mp4" title="Title"></video>
+
+From video we can see that decentralized can reach target faster and faster adapt to next target velocity. Central still better posture but it use more times to adapt to new veocity commands.
+Compare in RL term:
+![alt text](images/high_result.png)
+
+From graph
+- Central learn navigate faster because robust low lovel task. But decentral reach higher reward because speed of adaptation.
+
+**conclude**
+Decentralized Learning:
+- Independent leg control allows faster adaptation to target speed changes because each leg can respond individually without needing synchronization.
+- However, the learning process is noisier due to the lack of global coordination.
+
+Centralized Learning:
+- Achieves slightly lower final reward but demonstrates more stable and predictable performance.
+- When target velocities change, the agent must coordinate all legs simultaneously, which slows adaptation.
+- Learns faster in the early stages due to lower low-level velocity error, enabling more consistent feedback to the high-level controller.
+
+## Conclusion
+Decentralized learning provides more flexibility and can achieve higher rewards in dynamic tasks, but at the cost of higher variance and inconsistent behavior across legs. This can be beneficial when rapid adaptation is needed. In contrast, centralized learning ensures consistent and synchronized control, resulting in smoother, more stable locomotion and faster convergence in the early stages of training. The choice between these methods depends on the task requirements: decentralized for adaptability and centralized for stability and posture.
