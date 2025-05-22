@@ -280,9 +280,11 @@ algorithm_low = RslRlPpoAlgorithmCfg(
 ### Result : Low Level
 Task Performance
 - centralized:
+
 ![<video controls src="images/cen.mp4" title="Title"></video>](images/cen.gif)
 
 - decentralized:
+
 ![<video controls src="images/decen.mp4" title="Title"></video>](images/decen.gif)
 
 From video we can see that centralized can do task more smooth than decentral. It can control velocity better and also have better walking posture.
@@ -309,9 +311,11 @@ Centralized Learning:
 ### Result : High Level
 Task Performance
 - centralized:
+
 ![<video controls src="images/Navigate_cen.mp4" title="Title"></video>](images/Navigate_cen.gif)
 
 - decentralized:
+
 ![<video controls src="images/Navigate_decen.mp4" title="Title"></video>](images/Navigate_decen.gif)
 
 From video we can see that decentralized can reach target faster and faster adapt to next target velocity. Central still better posture but it use more times to adapt to new veocity commands.
