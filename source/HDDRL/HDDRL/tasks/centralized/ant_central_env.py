@@ -132,13 +132,16 @@ class AntCentralEnv(DirectRLEnv):
         self._episode_sums = {
             key: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
             for key in [
-                "lin_vel",
-                "up",
-                "alive",
-                "action",
-                "electricity",
-                "dof_at_limit",
-                "sum_reward"
+                # "lin_vel",
+                # "up",
+                # "alive",
+                # "action",
+                # "electricity",
+                # "dof_at_limit",
+                # "sum_reward"
+                "Velocity_X_Error",
+                "Velocity_Y_Error",
+                "Velocity_Error"
             ]
         }
     
@@ -216,7 +219,7 @@ class AntCentralEnv(DirectRLEnv):
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:        
         self._compute_intermediate_values()
         truncate = self.episode_length_buf >= self.max_episode_length - 1
-        terminate = self.torso_position[:, 2] < self.cfg.termination_height
+        terminate = torch.logical_or(self.torso_position[:, 2] < self.cfg.termination_height , self.torso_position[:, 2] > self.cfg.termination_height_up)
         # print(terminate)
         # print(truncate)
         # print('*'*30)
@@ -238,7 +241,7 @@ class AntCentralEnv(DirectRLEnv):
         self.robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
         
-        self._commands[env_ids] = torch.zeros_like(self._commands[env_ids]).uniform_(-1.5, 1.5) # Curriculum add here
+        self._commands[env_ids] = torch.zeros_like(self._commands[env_ids]).uniform_(-3.0, 3.0) # Curriculum add here
 
         # to_target = self.targets[env_ids] - default_root_state[:, :3]
         # to_target[:, 2] = 0.0
@@ -263,6 +266,8 @@ class AntCentralEnv(DirectRLEnv):
         # ------------------- Global ------------------- #
         # Lin vel Error 
         lin_vel_error = torch.sum(torch.square(self._commands[:, :2] - self.robot.data.root_lin_vel_b[:, :2]), dim=1)
+        lin_vel_error_x = torch.square(self._commands[:, 0] - self.robot.data.root_lin_vel_b[:, 0])
+        lin_vel_error_y = torch.square(self._commands[:, 1] - self.robot.data.root_lin_vel_b[:, 1])
         lin_vel_error_mapped = torch.exp(-lin_vel_error / 0.25) * self.cfg.tracking_lin_vel_weight
 
         # Command Error Yaw
@@ -283,13 +288,13 @@ class AntCentralEnv(DirectRLEnv):
 
         # ------------------- Local ------------------- #
 
-        action_rew = torch.sum(torch.abs(self.actions), dim=1) * self.cfg.actions_cost_scale
+        action_rew = torch.sum(torch.square(self.actions), dim=1) * self.cfg.actions_cost_scale /4.0
 
         # energy penalty for movement
-        electricity_cost = torch.sum(torch.abs(self.actions * self.dof_vel * self.cfg.dof_vel_scale) * self.motor_effort_ratio.unsqueeze(0),dim=-1,) * self.cfg.energy_cost_scale
+        electricity_cost = torch.sum(torch.abs(self.actions * self.dof_vel * self.cfg.dof_vel_scale) * self.motor_effort_ratio.unsqueeze(0),dim=-1,) * self.cfg.energy_cost_scale / 4.0
 
         # dof at limit cost
-        dof_at_limit_cost = torch.sum(self.dof_pos_scaled > 0.98, dim=-1)  * self.cfg.dof_at_limit_scale
+        dof_at_limit_cost = torch.sum(self.dof_pos_scaled > 0.98, dim=-1)  * self.cfg.dof_at_limit_scale /4.0
 
         # rew_global = torch.tensor(0)
         rew_global = lin_vel_error_mapped  + up_reward  + alive_reward + action_rew + electricity_cost + dof_at_limit_cost
@@ -298,13 +303,16 @@ class AntCentralEnv(DirectRLEnv):
         rew = torch.where(self.reset_buf, torch.ones_like(rew_global) * self.cfg.death_cost, rew_global)
         
         rewards = {
-            "lin_vel": lin_vel_error_mapped,
-            "up": up_reward,
-            "alive": alive_reward,
-            "action": action_rew,
-            "electricity": electricity_cost,
-            "dof_at_limit": dof_at_limit_cost,
-            "sum_reward": rew
+            # "lin_vel": lin_vel_error_mapped,
+            # "up": up_reward,
+            # "alive": alive_reward,
+            # "action": action_rew,
+            # "electricity": electricity_cost,
+            # "dof_at_limit": dof_at_limit_cost,
+            # "sum_reward": rew
+            "Velocity_X_Error": torch.sqrt(lin_vel_error_x),
+            "Velocity_Y_Error": torch.sqrt(lin_vel_error_y),
+            "Velocity_Error": torch.sqrt(lin_vel_error),
         }
         # Logging
         for key, value in rewards.items():

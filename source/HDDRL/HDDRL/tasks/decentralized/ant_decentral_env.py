@@ -186,26 +186,29 @@ class AntLegEnv(DirectMARLEnv):
         self._episode_sums = {
             key: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
             for key in [
-                "lin_vel",
-                "up",
-                "alive",
-                "action_fl",
-                "action_fr",
-                "action_hl",
-                "action_hr",
-                "electricity_fl",
-                "electricity_fr",
-                "electricity_hl",
-                "electricity_hr",
-                "dof_at_limit_fl",
-                "dof_at_limit_fr",
-                "dof_at_limit_hl",
-                "dof_at_limit_hr",
-                "global_reward",
-                "fl_local",
-                "fr_local",
-                "hl_local",
-                "hr_local"
+                # "lin_vel",
+                # "up",
+                # "alive",
+                # "action_fl",
+                # "action_fr",
+                # "action_hl",
+                # "action_hr",
+                # "electricity_fl",
+                # "electricity_fr",
+                # "electricity_hl",
+                # "electricity_hr",
+                # "dof_at_limit_fl",
+                # "dof_at_limit_fr",
+                # "dof_at_limit_hl",
+                # "dof_at_limit_hr",
+                # "global_reward",
+                # "fl_local",
+                # "fr_local",
+                # "hl_local",
+                # "hr_local"
+                "Velocity_X_Error",
+                "Velocity_Y_Error",
+                "Velocity_Error",
             ]
         }
 
@@ -354,7 +357,7 @@ class AntLegEnv(DirectMARLEnv):
         self.robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
         # clear out any old actions for those envs:
-        self._commands[env_ids] = torch.zeros_like(self._commands[env_ids]).uniform_(-5, 5) # Curriculum add here
+        self._commands[env_ids] = torch.zeros_like(self._commands[env_ids]).uniform_(-3.0, 3.0) # Curriculum add here
         self._compute_intermediate_values()
 
         # Logging
@@ -370,6 +373,8 @@ class AntLegEnv(DirectMARLEnv):
         # ------------------- Global ------------------- #
         # Lin vel Error 
         lin_vel_error = torch.sum(torch.square(self._commands[:, :2] - self.robot.data.root_lin_vel_b[:, :2]), dim=1)
+        lin_vel_error_x = torch.square(self._commands[:, 0] - self.robot.data.root_lin_vel_b[:, 0])
+        lin_vel_error_y = torch.square(self._commands[:, 1] - self.robot.data.root_lin_vel_b[:, 1])
         lin_vel_error_mapped = torch.exp(-lin_vel_error / 0.25) * self.cfg.tracking_lin_vel_weight
 
         # Command Error Yaw
@@ -431,26 +436,29 @@ class AntLegEnv(DirectMARLEnv):
         hr_rew = torch.where(self.reset_buf, torch.ones_like(rew_global) * self.cfg.death_cost, rew_global + hr_local)
 
         rewards = {
-            "lin_vel": lin_vel_error_mapped,
-            "up": up_reward,
-            "alive": alive_reward,
-            "action_fl": fl_action,
-            "action_fr": fr_action,
-            "action_hl": hl_action,
-            "action_hr": hr_action,
-            "electricity_fl": fl_electricity_cost,
-            "electricity_fr": fr_electricity_cost,
-            "electricity_hl": hl_electricity_cost,
-            "electricity_hr": hr_electricity_cost,
-            "dof_at_limit_fl": fl_dof_at_limit_cost,
-            "dof_at_limit_fr": fr_dof_at_limit_cost,
-            "dof_at_limit_hl": hl_dof_at_limit_cost,
-            "dof_at_limit_hr": hr_dof_at_limit_cost,
-            "global_reward": rew_global,
-            "fl_local": fl_local,
-            "fr_local": fr_local,
-            "hl_local": hl_local,
-            "hr_local": hr_local
+            # "lin_vel": lin_vel_error_mapped,
+            # "up": up_reward,
+            # "alive": alive_reward,
+            # "action_fl": fl_action,
+            # "action_fr": fr_action,
+            # "action_hl": hl_action,
+            # "action_hr": hr_action,
+            # "electricity_fl": fl_electricity_cost,
+            # "electricity_fr": fr_electricity_cost,
+            # "electricity_hl": hl_electricity_cost,
+            # "electricity_hr": hr_electricity_cost,
+            # "dof_at_limit_fl": fl_dof_at_limit_cost,
+            # "dof_at_limit_fr": fr_dof_at_limit_cost,
+            # "dof_at_limit_hl": hl_dof_at_limit_cost,
+            # "dof_at_limit_hr": hr_dof_at_limit_cost,
+            # "global_reward": rew_global,
+            # "fl_local": fl_local,
+            # "fr_local": fr_local,
+            # "hl_local": hl_local,
+            # "hr_local": hr_local
+            "Velocity_X_Error": torch.sqrt(lin_vel_error_x),
+            "Velocity_Y_Error": torch.sqrt(lin_vel_error_y),
+            "Velocity_Error": torch.sqrt(lin_vel_error),
         }
         # Logging
         for key, value in rewards.items():
