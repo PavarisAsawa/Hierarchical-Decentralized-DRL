@@ -134,12 +134,13 @@ class AntHighLevelEnv(DirectRLEnv):
         self.has_debug_vis_implementation = True
         self.set_debug_vis(True)
 
-        # self._episode_sums = {
-        #     key: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
-        #     for key in [
-                # "target",
-        #     ]
-        # }
+        self._episode_sums = {
+            key: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+            for key in [
+                "distance_error_normalize",
+                "distance_error",
+            ]
+        }
 
 
     
@@ -242,7 +243,7 @@ class AntHighLevelEnv(DirectRLEnv):
         self.robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
         
-        self._commands[env_ids] = torch.zeros_like(self._commands[env_ids]).uniform_(-1, 1) # pos env + uniform
+        self._commands[env_ids] = torch.zeros_like(self._commands[env_ids]).uniform_(-5, 5) # pos env + uniform
 
         # to_target = self.targets[env_ids] - default_root_state[:, :3]
         # to_target[:, 2] = 0.0
@@ -251,17 +252,13 @@ class AntHighLevelEnv(DirectRLEnv):
         self._compute_intermediate_values()
 
         # Logging
-        # extras = dict()
-        # for key in self._episode_sums.keys():
-        #     episodic_sum_avg = torch.mean(self._episode_sums[key][env_ids])
-        #     extras["Episode_Reward/" + key] = episodic_sum_avg / self.max_episode_length
-        #     self._episode_sums[key][env_ids] = 0.0
-        # self.extras["log"] = dict()
-        # self.extras["log"].update(extras)
-        # extras = dict()
-        # extras["Episode_Termination/base_contact"] = torch.count_nonzero(self.reset_terminated[env_ids]).item()
-        # extras["Episode_Termination/time_out"] = torch.count_nonzero(self.reset_time_outs[env_ids]).item()
-        # self.extras["log"].update(extras)
+        extras = dict()
+        for key in self._episode_sums.keys():
+            episodic_sum_avg = torch.mean(self._episode_sums[key][env_ids])
+            extras["Episode_Reward/" + key] = episodic_sum_avg / self.max_episode_length
+            self._episode_sums[key][env_ids] = 0.0
+        self.extras["log"] = dict()
+        self.extras["log"].update(extras)
 
     def _get_rewards(self) -> torch.Tensor:
         # ------------------- Global ------------------- #
@@ -269,11 +266,12 @@ class AntHighLevelEnv(DirectRLEnv):
         target = torch.norm(self._commands - self.pos_env , dim=1)
         target_reward = 1-torch.tanh(target / 1.5)
         rewards = {
-            "target": target_reward,
+            "distance_error_normalize": target_reward,
+            "distance_error": target,
         }
         # Logging
-        # for key, value in rewards.items():
-        #     self._episode_sums[key] += value
+        for key, value in rewards.items():
+            self._episode_sums[key] += value
         rew = torch.zeros(self.num_envs)
         return -target
     

@@ -65,7 +65,6 @@ class SlalomPPORunnerCfg(RslRlOnPolicyRunnerCfg):
 @configclass
 class CenNavigationEnvPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     # === Runner settings ===
-    experiment_name = "hi_cen"
     num_steps_per_env = 8
     max_iterations = 1500
     save_interval = 50
@@ -105,7 +104,7 @@ class CenNavigationEnvPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         entropy_coef=0.005,
         num_learning_epochs=5,
         num_mini_batches=4,
-        learning_rate=1.0e-3,
+        learning_rate=3e-4,
         schedule="adaptive",
         gamma=0.99,
         lam=0.95,
@@ -144,7 +143,7 @@ class DecenNavigationEnvPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         max_grad_norm=1.0,
     )
 
-        # === Policy Network ===
+    # === Policy Network ===
     policy_low = RslRlPpoActorCriticCfg(
         init_noise_std=1.0,
         actor_hidden_dims=[128, 128, 128],
@@ -157,7 +156,7 @@ class DecenNavigationEnvPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,
-        entropy_coef=0.01,
+        entropy_coef=0.005,
         num_learning_epochs=5,
         num_mini_batches=4,
         learning_rate=3e-4,

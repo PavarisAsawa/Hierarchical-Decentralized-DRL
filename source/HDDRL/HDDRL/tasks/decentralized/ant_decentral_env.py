@@ -181,7 +181,7 @@ class AntLegEnv(DirectMARLEnv):
         
         # set debug
         self.has_debug_vis_implementation = True
-        self.set_debug_vis(True)\
+        self.set_debug_vis(True)
         
         self._episode_sums = {
             key: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)

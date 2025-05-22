@@ -63,8 +63,8 @@ def main():
     resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
     log_dir = os.path.dirname(resume_path)
 
-    model_name = "2025-05-21_19-56-12/model_1499.pt"
-    low_level_path = os.path.join("logs", "rsl_rl", "anymal_d_rough", model_name)
+    model_name = "dims_512_256_128/model_1499.pt"
+    low_level_path = os.path.join("logs", "rsl_rl", "central", model_name)
     low_level_path = os.path.abspath(low_level_path)
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)

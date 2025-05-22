@@ -63,7 +63,7 @@ def main():
     resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
     log_dir = os.path.dirname(resume_path)
 
-    model_name = "2025-05-14_00-25-04/model_1499.pt"
+    model_name = "dims_128_128_128/model_1499.pt"
     low_level_path = os.path.join("logs", "rsl_rl", "decentral", model_name)
     low_level_path = os.path.abspath(low_level_path)
     # create isaac environment

@@ -134,12 +134,13 @@ class AntNavigateEnv(DirectRLEnv):
         self.has_debug_vis_implementation = True
         self.set_debug_vis(True)
 
-        # self._episode_sums = {
-        #     key: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
-        #     for key in [
-                # "target",
-        #     ]
-        # }
+        self._episode_sums = {
+            key: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+            for key in [
+                "distance_error_normalize",
+                "distance_error",
+            ]
+        }
 
 
     
@@ -242,7 +243,7 @@ class AntNavigateEnv(DirectRLEnv):
         self.robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
         
-        self._commands[env_ids] = torch.zeros_like(self._commands[env_ids]).uniform_(-1, 1) # pos env + uniform
+        self._commands[env_ids] = torch.zeros_like(self._commands[env_ids]).uniform_(-5, 5) # pos env + uniform
 
         # to_target = self.targets[env_ids] - default_root_state[:, :3]
         # to_target[:, 2] = 0.0
@@ -251,17 +252,13 @@ class AntNavigateEnv(DirectRLEnv):
         self._compute_intermediate_values()
 
         # Logging
-        # extras = dict()
-        # for key in self._episode_sums.keys():
-        #     episodic_sum_avg = torch.mean(self._episode_sums[key][env_ids])
-        #     extras["Episode_Reward/" + key] = episodic_sum_avg / self.max_episode_length
-        #     self._episode_sums[key][env_ids] = 0.0
-        # self.extras["log"] = dict()
-        # self.extras["log"].update(extras)
-        # extras = dict()
-        # extras["Episode_Termination/base_contact"] = torch.count_nonzero(self.reset_terminated[env_ids]).item()
-        # extras["Episode_Termination/time_out"] = torch.count_nonzero(self.reset_time_outs[env_ids]).item()
-        # self.extras["log"].update(extras)
+        extras = dict()
+        for key in self._episode_sums.keys():
+            episodic_sum_avg = torch.mean(self._episode_sums[key][env_ids])
+            extras["Episode_Reward/" + key] = episodic_sum_avg / self.max_episode_length
+            self._episode_sums[key][env_ids] = 0.0
+        self.extras["log"] = dict()
+        self.extras["log"].update(extras)
 
     def _get_rewards(self) -> torch.Tensor:
         # ------------------- Global ------------------- #
@@ -272,13 +269,20 @@ class AntNavigateEnv(DirectRLEnv):
         up_reward = torch.zeros(self.num_envs , device=self.sim.device)
         up_reward = torch.where(self.robot.data.projected_gravity_b[: , 2] > -0.9, torch.abs(self.robot.data.projected_gravity_b[: , 2]) * self.cfg.up_weight, up_reward)
         alive_reward = torch.ones(self.num_envs ,device=self.sim.device) * self.cfg.alive_reward_scale * 0.0
-        action_rew = torch.sum(torch.abs(self.actions), dim=1) * self.cfg.actions_cost_scale
-        electricity_cost = torch.sum(torch.abs(self.actions * self.dof_vel * self.cfg.dof_vel_scale) * self.motor_effort_ratio.unsqueeze(0),dim=-1,) * self.cfg.energy_cost_scale
-        dof_at_limit_cost = torch.sum(self.dof_pos_scaled > 0.98, dim=-1)  * self.cfg.dof_at_limit_scale
+        action_rew = torch.sum(torch.abs(self.actions), dim=1) * self.cfg.actions_cost_scale / 4.0
+        electricity_cost = torch.sum(torch.abs(self.actions * self.dof_vel * self.cfg.dof_vel_scale) * self.motor_effort_ratio.unsqueeze(0),dim=-1,) * self.cfg.energy_cost_scale / 4.0
+        dof_at_limit_cost = torch.sum(self.dof_pos_scaled > 0.98, dim=-1)  * self.cfg.dof_at_limit_scale / 4.0
 
         rew_global = lin_vel_error_mapped  + up_reward  + alive_reward + action_rew + electricity_cost + dof_at_limit_cost - target
 
         rew = torch.where(self.reset_buf, torch.ones_like(rew_global) * self.cfg.death_cost, rew_global)
+        target_reward = 1-torch.tanh(target / 1.5)
+        rewards = {
+            "distance_error_normalize": target_reward,
+            "distance_error": target,
+        }
+        for key, value in rewards.items():
+            self._episode_sums[key] += value
         return rew
     
     def _get_foot_status(self):
