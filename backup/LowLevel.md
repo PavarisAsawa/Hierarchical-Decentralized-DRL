@@ -10,7 +10,7 @@ In IsaacLab
 - Action : encourages the agent to actually move its legs (i.e. to swing rather than remain still)
 - Electricity Cost : promotes energy-efficient motions
 - DoF limit : discourages holding a joint at its extreme and thus encourages continual leg swinging
-- death : if Agent is Terminated got the penalth
+- death : if Agent is Terminated got the penalty
 
 all weight value is contain in below list
 
