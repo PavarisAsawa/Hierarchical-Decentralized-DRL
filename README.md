@@ -33,8 +33,6 @@ git clone https://github.com/PavarisAsawa/Hierarchical-Decentralized-DRL.git
 
 ```
 
-
-
 - Using a python interpreter that has Isaac Lab installed, install the library
 
 ```bash
@@ -64,11 +62,11 @@ This project is contain with 2 level with controller
 </div>
 
 
-## Training
-### Training : Low Level Decentralized
+## Environment and Agent
+### Environment and Agent : Low Level Decentralized
 For Low Level Decentralized we using IPPO algorithms which is each leg seperate agent but using same global or average reward for updating policy
 
-Observavtion space:
+#### Observavtion space:
 - Global Observation (every leg have this Observation as same)
     - Linear Velocity: Linear velocity of robot in x, y axis (size = 2)
     - Projected Gravity: Direction of gravity force project to robot frame (size = 3)
@@ -79,7 +77,7 @@ Observavtion space:
     - Joint Velocity: velocity of each joint on leg (size = 2) 
 - Size of observation space is 15 for each leg.
 
-Reward:
+#### Reward:
 - Linear Velocity: Reward given that robot velocity close to target velocity
 ```
 lin_vel_error = torch.sum(torch.square(self._commands[:, :2] - self.robot.data.root_lin_vel_b[:, :2]), dim=1)
@@ -107,7 +105,27 @@ For reward Action, Electricity and DoF at Limit there are local reward which is 
 
 For IPPO algorithm so reward will average to make global reward that use for update each leg policy
 
-Agent: Each leg using seperate agent which is PPO base. Each leg have same hyper paprameter which is
+If the robot is terminated due to an out-of-range base position in z axis, the agent will receive a reward equal to death_cost.
+
+**List of weight**
+- tracking_lin_vel_weight: float = 3.0
+- up_weight: float = -0.3
+- dof_vel_scale: float = 0.2
+- energy_cost_scale: float = 0.00025
+- actions_cost_scale: float = 0.0001
+- dof_at_limit_scale: float =0.01
+- death_cost: float = -2.0   
+
+#### Termination:
+- Timeout: The episode ends when the robot stays alive for the specified time limit.
+- Torso position: The episode ends if the robot's base position (Z) goes too high (more than 1.0) or too low (less than 0.36). This prevents the agent from jumping or collapsing flat on the floor.
+
+#### Action
+Action is joint effort in decentralized each agent can control 2 joint in each leg.
+
+#### Agent:
+
+Each leg using seperate agent which is PPO base. Each leg have same hyper paprameter which is
 ```
 experiment_name = "decentral"
 num_steps_per_env = 24
@@ -139,10 +157,10 @@ algorithm = RslRlPpoAlgorithmCfg(
     max_grad_norm=1.0,
 )
 ```
-### Training : Low Level Centralized
+### Environment and Agent : Low Level Centralized
 For Low Level Centralized we using normal PPO algorithms
 
-Observavtion space:
+#### Observavtion space:
 - Linear Velocity: Linear velocity of robot in x, y axis (size = 2)
 - Projected Gravity: Direction of gravity force project to robot frame (size = 3)
 - Velocity Command: Target velocity command in x, y axis in locomotion task (size = 2)
@@ -152,7 +170,7 @@ Observavtion space:
 
 Size of observation space is 27.
 
-Reward:
+#### Reward:
 - Linear Velocity: Reward given that robot velocity close to target velocity
 ```
 lin_vel_error = torch.sum(torch.square(self._commands[:, :2] - self.robot.data.root_lin_vel_b[:, :2]), dim=1)
@@ -178,7 +196,27 @@ dof_at_limit_cost = torch.sum(self.dof_pos_scaled > 0.98, dim=-1)  * self.cfg.do
 
 For reward Action, Electricity and DoF at Limit there are local reward for decentralize so in central we sum all 4 leg and devide by 4 to calculate average from all leg.
 
-Agent: It's PPO base. And have hyper paprameter which is
+If the robot is terminated due to an out-of-range base position in z axis, the agent will receive a reward equal to death_cost.
+
+**List of weight**
+- tracking_lin_vel_weight: float = 3.0
+- up_weight: float = -0.3
+- dof_vel_scale: float = 0.2
+- energy_cost_scale: float = 0.00025
+- actions_cost_scale: float = 0.0001
+- dof_at_limit_scale: float =0.01
+- death_cost: float = -2.0   
+
+#### Termination:
+- Timeout: The episode ends when the robot stays alive for the specified time limit.
+- Torso position: The episode ends if the robot's base position (Z) goes too high (more than 1.0) or too low (less than 0.36). This prevents the agent from jumping or collapsing flat on the floor.
+
+#### Action
+Action is joint effort in centralized agent can control all of joint (8 joints)
+
+#### Agent:
+
+It's PPO base. And have hyper paprameter which is
 ```
 num_steps_per_env = 24
 max_iterations = 1500
@@ -207,23 +245,34 @@ algorithm = RslRlPpoAlgorithmCfg(
     max_grad_norm=1.0,
 )
 ```
-### Training : High Level
+### Environment and Agent : High Level
 In high level it have objective to nevigate robot to target postion.
 
-Observavtion space:
+#### Observavtion space:
 - Heading: direction that robot heading to (yaw angle) (size = 1)
 - Distance: Distance from robot to targ
 et position in x-y axis (size = 2)
 
 Size of observation space is 3.
 
-Reward:
+#### Reward:
 - Distance Penalty: Penalty given when robot position far from target position.
 ```
 target = -torch.norm(self._commands - self.pos_env , dim=1)
 ```
 
-Agent: It's PPO base. And have hyper paprameter which is (policy_low and algorithm_low is hyperparameter of low level should config to same as low level model)
+#### Termination:
+- Timeout: The episode ends when the robot stays alive for the specified time limit.
+- Torso position: The episode ends if the robot's base position (Z) goes too high (more than 1.0) or too low (less than 0.36). This prevents the agent from jumping or collapsing flat on the floor.
+- Reach target: The episode ends if distance between robot and target is in treshold.
+
+#### Action
+
+Action is target velocity in x and y direction in robot frame and pass it to low level agent.
+
+#### Agent:
+
+It's PPO base. And have hyper paprameter which is (policy_low and algorithm_low is hyperparameter of low level should config to same as low level model)
 ```
 num_steps_per_env = 8
 max_iterations = 1500
@@ -276,6 +325,83 @@ algorithm_low = RslRlPpoAlgorithmCfg(
 )
 ```
 
+## Training and Playing
+### Training and Playing : Low Level Decentralized
+**Train**
+```
+python scripts/rsl_rl/train_IPPO.py --task decentral
+```
+**Play**
+```
+python scripts/rsl_rl/play_IPPO.py --task decentral --load_run floder_name(inside logs/rsl_rl/decentral) --checkpoint model_xxx --num_envs 1
+```
+
+**Change Agent configuration**
+- You can change config at "source/HDDRL/HDDRL/tasks/decentralized/agents/rsl_rl_ppo_cfg.py"
+### Training and Playing : Low Level Centralized
+**Train**
+```
+python scripts/rsl_rl/train.py --task central
+```
+**Play**
+```
+python scripts/rsl_rl/play.py --task central --load_run floder_name(inside logs/rsl_rl/central) --checkpoint model_xxx --num_envs 1
+```
+
+**Change Agent configuration**
+- You can change config at "source/HDDRL/HDDRL/tasks/centralized/agents/rsl_rl_ppo_cfg.py"
+
+### Training and Playing : High Level
+#### High Level with Decentral
+**Setting up**
+- Change low level decentral model at file "scripts/rsl_rl/train_high_decen.py" variable **"model_name"**
+
+- Change **policy_low** config and **algorithm_low** config to match config of low level decentral model at "source/HDDRL/HDDRL/tasks/highlevel/agents/rsl_rl_ppo_cfg.py" class **DecenNavigationEnvPPORunnerCfg**
+
+- Change source/HDDRL/HDDRL/tasks/highlevel/\__init__.py to
+```
+"rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:DecenNavigationEnvPPORunnerCfg",
+# "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:CenNavigationEnvPPORunnerCfg",
+```
+
+**Train**
+```
+python scripts/rsl_rl/train_high_decen.py --task highlevel
+```
+
+**Play**
+```
+python scripts/rsl_rl/play_high_decen.py --task highlevel --load_run floder_name(inside logs/rsl_rl/Navigate_decen) --checkpoint model_xxx --num_envs 1
+```
+
+**Change Agent configuration**
+- You can change config at "source/HDDRL/HDDRL/tasks/highlevel/agents/rsl_rl_ppo_cfg.py" class **DecenNavigationEnvPPORunnerCfg**
+
+#### High Level with Central
+**Setting up**
+- Change low level central model at file "scripts/rsl_rl/train_high_cen.py" variable **"model_name"**
+
+- Change **policy_low** config and **algorithm_low** config to match config of low level central model at "source/HDDRL/HDDRL/tasks/highlevel/agents/rsl_rl_ppo_cfg.py" class **CenNavigationEnvPPORunnerCfg**
+
+- Change source/HDDRL/HDDRL/tasks/highlevel/\__init__.py to
+```
+# "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:DecenNavigationEnvPPORunnerCfg",
+"rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:CenNavigationEnvPPORunnerCfg",
+```
+
+**Train**
+```
+python scripts/rsl_rl/train_high_cen.py --task highlevel
+```
+
+**Play**
+```
+python scripts/rsl_rl/play_high_cen.py --task highlevel --load_run floder_name(inside logs/rsl_rl/Navigate_cen) --checkpoint model_xxx --num_envs 1
+```
+
+**Change Agent configuration**
+- You can change config at "source/HDDRL/HDDRL/tasks/highlevel/agents/rsl_rl_ppo_cfg.py" class **CenNavigationEnvPPORunnerCfg**
+
 ## Result
 ### Result : Low Level
 Task Performance
@@ -325,7 +451,7 @@ Compare in RL term:
 From graph
 - Central learn navigate faster because robust low lovel task. But decentral reach higher reward because speed of adaptation.
 
-**conclude**
+**Conclude**
 Decentralized Learning:
 - Independent leg control allows faster adaptation to target speed changes because each leg can respond individually without needing synchronization.
 - However, the learning process is noisier due to the lack of global coordination.
