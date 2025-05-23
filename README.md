@@ -264,7 +264,7 @@ target = -torch.norm(self._commands - self.pos_env , dim=1)
 #### Termination:
 - Timeout: The episode ends when the robot stays alive for the specified time limit.
 - Torso position: The episode ends if the robot's base position (Z) goes too high (more than 1.0) or too low (less than 0.36). This prevents the agent from jumping or collapsing flat on the floor.
-- Reach target: The episode ends if distance between robot and target is in treshold.
+- Reach target: The episode ends if distance between robot and target is in threshold.
 
 #### Action
 
